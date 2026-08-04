@@ -12,6 +12,7 @@ export default function App() {
   const [backendAvailable, setBackendAvailable] = useState(null);
   const [voices, setVoices] = useState([]);
   const [selectedVoice, setSelectedVoice] = useState(null);
+  const englishVoices = voices.filter(v => v.lang && v.lang.startsWith('en'));
   const [audioUrl, setAudioUrl] = useState(null);
 
   const { chunks, streaming, error: wsError, startStream, stopStream } = useAudioStream();
@@ -57,20 +58,27 @@ export default function App() {
     }
     return () => { synth.onvoiceschanged = null; };
   }, []);
+  // Keep selectedVoice synced to available English voices
+  useEffect(() => {
+    if (englishVoices.length && (!selectedVoice || !englishVoices.find(v => v.name === selectedVoice.name))) {
+      setSelectedVoice(englishVoices[0]);
+    }
+  }, [englishVoices, selectedVoice]);
+
 
   const getVoiceForPersona = useCallback(() => {
-    if (!voices.length) return null;
+    if (!englishVoices.length) return null;
     if (persona === 'Data') {
-      return voices.find((v) => v.name.includes('Google US English') || v.name.includes('Samantha')) || voices[0];
+      return englishVoices.find((v) => v.name.includes('Google US English') || v.name.includes('Samantha')) || englishVoices[0];
     }
     if (persona === 'Worf') {
-      return voices.find((v) => v.name.includes('Daniel') || v.name.includes('Fred')) || voices[0];
+      return englishVoices.find((v) => v.name.includes('Daniel') || v.name.includes('Fred')) || englishVoices[0];
     }
     if (persona === 'Troi') {
-      return voices.find((v) => v.name.includes('Victoria') || v.name.includes('Karen')) || voices[0];
+      return englishVoices.find((v) => v.name.includes('Victoria') || v.name.includes('Karen')) || englishVoices[0];
     }
-    return voices[0];
-  }, [persona, voices]);
+    return englishVoices[0];
+  }, [persona, englishVoices]);
 
   const speakBrowser = useCallback(() => {
     const synth = window.speechSynthesis;
@@ -324,14 +332,14 @@ export default function App() {
                   setSelectedVoice(v || voices[0]);
                 }}
               >
-                {voices.length === 0 && <option value="">No voices — install speech-dispatcher</option>}
-                {voices.map((v) => (
+                {englishVoices.length === 0 && <option value="">No English voices — install espeak-ng</option>}
+                {englishVoices.map((v) => (
                   <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>
                 ))}
               </select>
               {voices.length === 0 && (
                 <p className="text-xs text-red-400 mt-1">
-                  No TTS voices detected. Run: sudo dnf install speech-dispatcher espeak-ng
+                  No English TTS voices detected. Run: sudo dnf install espeak-ng speech-dispatcher-espeak
                 </p>
               )}
             </div>
