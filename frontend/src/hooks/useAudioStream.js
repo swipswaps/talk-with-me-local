@@ -19,9 +19,16 @@ export function useAudioStream() {
     };
 
     ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      setChunks((prev) => [...prev, data]);
-      if (data.status === 'complete') {
+      try {
+        const data = JSON.parse(event.data);
+        setChunks((prev) => [...prev, data]);
+        if (data.status === 'complete') {
+          setStreaming(false);
+          ws.close();
+        }
+      } catch (err) {
+        console.error('Failed to parse WebSocket message:', err);
+        setError('Received invalid data from server');
         setStreaming(false);
         ws.close();
       }
