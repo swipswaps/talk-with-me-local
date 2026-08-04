@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useAudioStream } from './hooks/useAudioStream';
 
 export default function App() {
@@ -15,6 +15,7 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState(null);
 
   const { chunks, streaming, error: wsError, startStream, stopStream } = useAudioStream();
+  const synthRef = useRef(window.speechSynthesis);
 
   // Detect backend
   useEffect(() => {
@@ -35,7 +36,7 @@ export default function App() {
 
   // Load browser TTS voices with retry
   useEffect(() => {
-    const synth = window.speechSynthesis;
+    const synth = synthRef.current;
     if (!synth) return;
 
     let retries = 0;
@@ -44,9 +45,9 @@ export default function App() {
       if (v.length) {
         setVoices(v);
         if (!selectedVoice) setSelectedVoice(v[0]);
-      } else if (retries < 5) {
+      } else if (retries < 10) {
         retries++;
-        setTimeout(loadVoices, 500);
+        setTimeout(loadVoices, 300);
       }
     };
 
@@ -71,10 +72,22 @@ export default function App() {
     return voices[0];
   }, [persona, voices]);
 
+  const stopAllAudio = useCallback(() => {
+    const synth = synthRef.current;
+    if (synth) {
+      synth.cancel();
+      if (synth.paused) synth.resume();
+    }
+    stopStream();
+    setSpeaking(false);
+    setLoading(false);
+  }, [stopStream]);
+
   const speakBrowser = useCallback(() => {
-    const synth = window.speechSynthesis;
+    const synth = synthRef.current;
     if (!synth) {
-      setResponseLog({ status: 'error', message: 'Browser TTS not supported in this browser.' });
+      setResponseLog({ status: 'error', message: 'Browser TTS not supported.' });
+      setLoading(false);
       return;
     }
 
@@ -82,13 +95,15 @@ export default function App() {
     if (!v.length) {
       setResponseLog({
         status: 'error',
-        message: 'No TTS voices found. On Linux/Fedora, install: sudo dnf install speech-dispatcher espeak-ng'
+        message: 'No TTS voices found. On Fedora: sudo dnf install speech-dispatcher espeak-ng'
       });
+      setLoading(false);
       return;
     }
 
-    if (synth.paused) synth.resume();
+    // Aggressive cancel to prevent echo/double-play
     synth.cancel();
+    if (synth.paused) synth.resume();
 
     const utter = new SpeechSynthesisUtterance(text);
     const voice = getVoiceForPersona();
@@ -100,11 +115,8 @@ export default function App() {
 
     setSpeaking(true);
     setAudioUrl(null);
-    setResponseLog({ status: 'speaking', message: 'Speaking as ' + persona + ' using ' + (voice ? voice.name : 'default voice') });
+    setResponseLog({ status: 'speaking', message: 'Speaking as ' + persona + '...' });
 
-    utter.onstart = () => {
-      setResponseLog({ status: 'speaking', message: 'Now speaking...' });
-    };
     utter.onend = () => {
       setSpeaking(false);
       setResponseLog({ status: 'complete', message: 'Browser TTS finished.' });
@@ -115,32 +127,38 @@ export default function App() {
     };
 
     synth.speak(utter);
-  }, [text, persona, getVoiceForPersona, voices]);
+  }, [text, persona, getVoiceForPersona]);
 
   const streamBrowser = useCallback(() => {
-    const synth = window.speechSynthesis;
+    const synth = synthRef.current;
     if (!synth) {
       setResponseLog({ status: 'error', message: 'Browser TTS not supported.' });
+      setLoading(false);
       return;
     }
-    if (!synth.getVoices().length) {
+    const v = synth.getVoices();
+    if (!v.length) {
       setResponseLog({
         status: 'error',
         message: 'No TTS voices found. Install: sudo dnf install speech-dispatcher espeak-ng'
       });
+      setLoading(false);
       return;
     }
 
-    if (synth.paused) synth.resume();
     synth.cancel();
+    if (synth.paused) synth.resume();
 
     const sentences = text.replace(/[?!]/g, '.').split('.').map((s) => s.trim()).filter((s) => s.length > 0);
-    if (!sentences.length) return;
+    if (!sentences.length) {
+      setLoading(false);
+      return;
+    }
 
     setSpeaking(true);
     setAudioUrl(null);
-    const logChunks = [];
     let completed = 0;
+    const total = sentences.length;
 
     sentences.forEach((chunk, i) => {
       const utter = new SpeechSynthesisUtterance(chunk);
@@ -152,14 +170,13 @@ export default function App() {
       else if (persona === 'Troi') { utter.rate = 1.0; utter.pitch = 1.05; }
 
       utter.onstart = () => {
-        logChunks.push({ chunk_index: i + 1, total_chunks: sentences.length, status: 'streaming', text_chunk: chunk });
-        setResponseLog({ status: 'streaming', chunks: [...logChunks], message: 'Speaking chunk ' + (i + 1) + '/' + sentences.length });
+        setResponseLog({ status: 'streaming', message: 'Speaking ' + (i + 1) + '/' + total + ': ' + chunk });
       };
       utter.onend = () => {
         completed++;
-        if (completed >= sentences.length) {
+        if (completed >= total) {
           setSpeaking(false);
-          setResponseLog({ status: 'complete', chunks: logChunks, message: 'Browser TTS stream complete.' });
+          setResponseLog({ status: 'complete', message: 'Browser TTS stream complete.' });
         }
       };
       utter.onerror = () => {
@@ -168,20 +185,16 @@ export default function App() {
       };
       synth.speak(utter);
     });
-  }, [text, persona, getVoiceForPersona, voices]);
-
-  const handleStop = useCallback(() => {
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
-    stopStream();
-    setSpeaking(false);
-    setLoading(false);
-    setStreaming && setStreaming(false);
-  }, [stopStream]);
+  }, [text, persona, getVoiceForPersona]);
 
   const handleSynthesize = async (e) => {
     e.preventDefault();
+    // Immediate lock — prevents echo from double-clicks
+    if (loading || speaking || streaming) return;
+
     setResponseLog(null);
     setAudioUrl(null);
+    setLoading(true);
 
     if (backendAvailable === false) {
       if (useStreaming) streamBrowser();
@@ -203,10 +216,12 @@ export default function App() {
         if (data.audio_base64) {
           setAudioUrl('data:audio/wav;base64,' + data.audio_base64);
         }
+        setLoading(false);
         return;
       } catch {
         setBackendAvailable(false);
         setUseStreaming(false);
+        setLoading(false);
         if (useStreaming) streamBrowser();
         else speakBrowser();
         return;
@@ -214,11 +229,11 @@ export default function App() {
     }
 
     if (useStreaming) {
+      setLoading(false);
       startStream({ persona, engine, text });
       return;
     }
 
-    setLoading(true);
     try {
       const res = await fetch('/api/synthesize', {
         method: 'POST',
@@ -244,7 +259,7 @@ export default function App() {
       ? '🔌 Backend mode'
       : '⏳ Detecting backend...';
 
-  const isActive = speaking || streaming || loading;
+  const isActive = loading || speaking || streaming;
 
   return (
     <div className="min-h-screen p-6 font-sans max-w-4xl mx-auto">
@@ -255,103 +270,127 @@ export default function App() {
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <form onSubmit={handleSynthesize} className="bg-gray-800 p-6 rounded-lg shadow border border-gray-700 space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-1">Select Persona</label>
-            <select
-              className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
-              value={persona}
-              onChange={(e) => setPersona(e.target.value)}
-            >
-              <option value="Data">Commander Data (TNG)</option>
-              <option value="Worf">Lieutenant Worf</option>
-              <option value="Troi">Counselor Troi</option>
-            </select>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium mb-1">TTS Engine</label>
-            <select
-              className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
-              value={engine}
-              onChange={(e) => setEngine(e.target.value)}
-              disabled={backendAvailable === false}
-            >
-              <option value="qwen3">Qwen3-TTS (Fast / Emotion Control)</option>
-              <option value="dots">Dots.TTS (High Quality Cloning)</option>
-            </select>
-            {backendAvailable === false && (
-              <p className="text-xs text-gray-500 mt-1">Engine selection requires local backend. Using browser voices.</p>
-            )}
-          </div>
-
+        <div className="space-y-4">
+          {/* Backend directions panel */}
           {backendAvailable === false && (
-            <div>
-              <label className="block text-sm font-medium mb-1">Browser Voice {voices.length === 0 && <span className="text-red-400">(none found)</span>}</label>
-              <select
-                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white text-xs"
-                value={selectedVoice ? selectedVoice.name : ''}
-                onChange={(e) => {
-                  const v = voices.find((voice) => voice.name === e.target.value);
-                  setSelectedVoice(v || voices[0]);
-                }}
-              >
-                {voices.length === 0 && <option value="">No voices — install speech-dispatcher</option>}
-                {voices.map((v) => (
-                  <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>
-                ))}
-              </select>
-              {voices.length === 0 && (
-                <p className="text-xs text-red-400 mt-1">
-                  No TTS voices detected. Run: sudo dnf install speech-dispatcher espeak-ng
-                </p>
-              )}
+            <div className="bg-yellow-900/30 border border-yellow-700 p-4 rounded-lg">
+              <h3 className="text-yellow-400 font-semibold text-sm mb-2">🔌 Enable Full Backend</h3>
+              <p className="text-gray-300 text-xs mb-2">
+                To unlock WebSocket streaming, Qwen3-TTS engine selection, and higher-quality synthesis:
+              </p>
+              <div className="bg-gray-900 rounded p-3 font-mono text-xs text-green-400 space-y-1">
+                <div>git clone https://github.com/swipswaps/talk-with-me-local.git</div>
+                <div>cd talk-with-me-local</div>
+                <div>chmod +x run.sh</div>
+                <div>./run.sh</div>
+                <div className="text-gray-500"># Then open http://localhost:5173</div>
+              </div>
+              <p className="text-gray-400 text-xs mt-2">
+                Or on this machine, run: <span className="text-white font-mono">./run.sh</span>
+              </p>
             </div>
           )}
 
-          <div>
-            <label className="block text-sm font-medium mb-1">Script to Synthesize</label>
-            <textarea
-              rows="4"
-              className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-            />
-          </div>
-
-          <div className="flex items-center space-x-2">
-            <input
-              type="checkbox"
-              id="streaming"
-              checked={useStreaming}
-              onChange={(e) => setUseStreaming(e.target.checked)}
-              disabled={backendAvailable === false}
-              className="rounded border-gray-600 bg-gray-900"
-            />
-            <label htmlFor="streaming" className="text-sm text-gray-300">
-              {backendAvailable === false ? 'Streaming (backend required)' : 'Use WebSocket Streaming'}
-            </label>
-          </div>
-
-          <div className="flex space-x-2">
-            <button
-              type="submit"
-              disabled={isActive}
-              className="flex-1 bg-cyan-600 hover:bg-cyan-500 font-semibold py-2 px-4 rounded transition duration-150 disabled:opacity-50"
-            >
-              {isActive ? 'Synthesizing...' : 'Generate Voice Stream'}
-            </button>
-            {isActive && (
-              <button
-                type="button"
-                onClick={handleStop}
-                className="bg-red-600 hover:bg-red-500 font-semibold py-2 px-4 rounded transition duration-150"
+          <form onSubmit={handleSynthesize} className="bg-gray-800 p-6 rounded-lg shadow border border-gray-700 space-y-4">
+            <div>
+              <label className="block text-sm font-medium mb-1">Select Persona</label>
+              <select
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
+                value={persona}
+                onChange={(e) => setPersona(e.target.value)}
               >
-                Stop
-              </button>
+                <option value="Data">Commander Data (TNG)</option>
+                <option value="Worf">Lieutenant Worf</option>
+                <option value="Troi">Counselor Troi</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">TTS Engine</label>
+              <select
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
+                value={engine}
+                onChange={(e) => setEngine(e.target.value)}
+                disabled={backendAvailable === false}
+              >
+                <option value="qwen3">Qwen3-TTS (Fast / Emotion Control)</option>
+                <option value="dots">Dots.TTS (High Quality Cloning)</option>
+              </select>
+              {backendAvailable === false && (
+                <p className="text-xs text-gray-500 mt-1">Engine selection requires local backend.</p>
+              )}
+            </div>
+
+            {backendAvailable === false && (
+              <div>
+                <label className="block text-sm font-medium mb-1">
+                  Browser Voice {voices.length === 0 && <span className="text-red-400">(none found)</span>}
+                </label>
+                <select
+                  className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white text-xs"
+                  value={selectedVoice ? selectedVoice.name : ''}
+                  onChange={(e) => {
+                    const v = voices.find((voice) => voice.name === e.target.value);
+                    setSelectedVoice(v || voices[0]);
+                  }}
+                >
+                  {voices.length === 0 && <option value="">No voices — install speech-dispatcher</option>}
+                  {voices.map((v) => (
+                    <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>
+                  ))}
+                </select>
+                {voices.length === 0 && (
+                  <p className="text-xs text-red-400 mt-1">
+                    No voices detected. Run: sudo dnf install speech-dispatcher espeak-ng
+                  </p>
+                )}
+              </div>
             )}
-          </div>
-        </form>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Script to Synthesize</label>
+              <textarea
+                rows="4"
+                className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white"
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+              />
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <input
+                type="checkbox"
+                id="streaming"
+                checked={useStreaming}
+                onChange={(e) => setUseStreaming(e.target.checked)}
+                disabled={backendAvailable === false}
+                className="rounded border-gray-600 bg-gray-900"
+              />
+              <label htmlFor="streaming" className="text-sm text-gray-300">
+                {backendAvailable === false ? 'Streaming (backend required)' : 'Use WebSocket Streaming'}
+              </label>
+            </div>
+
+            <div className="flex space-x-2">
+              <button
+                type="submit"
+                disabled={isActive}
+                className="flex-1 bg-cyan-600 hover:bg-cyan-500 font-semibold py-2 px-4 rounded transition duration-150 disabled:opacity-50"
+              >
+                {isActive ? 'Synthesizing...' : 'Generate Voice Stream'}
+              </button>
+              {isActive && (
+                <button
+                  type="button"
+                  onClick={stopAllAudio}
+                  className="bg-red-600 hover:bg-red-500 font-semibold py-2 px-4 rounded transition duration-150"
+                >
+                  Stop
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
 
         <div className="bg-gray-800 p-6 rounded-lg shadow border border-gray-700 flex flex-col">
           <h2 className="text-lg font-semibold mb-3 text-cyan-300">Execution Output</h2>
