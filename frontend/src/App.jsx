@@ -6,40 +6,50 @@ export default function App() {
   const [engine, setEngine] = useState('qwen3');
   const [text, setText] = useState('Captain, I think we should do a sick wheelie with the Enterprise.');
   const [loading, setLoading] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const [responseLog, setResponseLog] = useState(null);
   const [useStreaming, setUseStreaming] = useState(false);
   const [backendAvailable, setBackendAvailable] = useState(null);
   const [voices, setVoices] = useState([]);
   const [selectedVoice, setSelectedVoice] = useState(null);
+  const [audioUrl, setAudioUrl] = useState(null);
 
   const { chunks, streaming, error: wsError, startStream, stopStream } = useAudioStream();
 
-  // Detect backend availability with 2s timeout
+  // Detect backend
   useEffect(() => {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 2000);
+    const t = setTimeout(() => controller.abort(), 2000);
     fetch('/health', { signal: controller.signal })
       .then((r) => {
-        clearTimeout(timeoutId);
+        clearTimeout(t);
         if (r.ok) setBackendAvailable(true);
         else throw new Error('unhealthy');
       })
       .catch(() => {
-        clearTimeout(timeoutId);
+        clearTimeout(t);
         setBackendAvailable(false);
         setUseStreaming(false);
       });
   }, []);
 
-  // Load browser TTS voices
+  // Load browser TTS voices with retry
   useEffect(() => {
     const synth = window.speechSynthesis;
     if (!synth) return;
+
+    let retries = 0;
     const loadVoices = () => {
       const v = synth.getVoices();
-      setVoices(v);
-      if (v.length && !selectedVoice) setSelectedVoice(v[0]);
+      if (v.length) {
+        setVoices(v);
+        if (!selectedVoice) setSelectedVoice(v[0]);
+      } else if (retries < 5) {
+        retries++;
+        setTimeout(loadVoices, 500);
+      }
     };
+
     loadVoices();
     if (synth.onvoiceschanged !== undefined) {
       synth.onvoiceschanged = loadVoices;
@@ -64,10 +74,22 @@ export default function App() {
   const speakBrowser = useCallback(() => {
     const synth = window.speechSynthesis;
     if (!synth) {
-      setResponseLog({ status: 'error', message: 'Browser TTS not supported' });
+      setResponseLog({ status: 'error', message: 'Browser TTS not supported in this browser.' });
       return;
     }
+
+    const v = synth.getVoices();
+    if (!v.length) {
+      setResponseLog({
+        status: 'error',
+        message: 'No TTS voices found. On Linux/Fedora, install: sudo dnf install speech-dispatcher espeak-ng'
+      });
+      return;
+    }
+
+    if (synth.paused) synth.resume();
     synth.cancel();
+
     const utter = new SpeechSynthesisUtterance(text);
     const voice = getVoiceForPersona();
     if (voice) utter.voice = voice;
@@ -76,31 +98,47 @@ export default function App() {
     else if (persona === 'Worf') { utter.rate = 0.85; utter.pitch = 0.8; }
     else if (persona === 'Troi') { utter.rate = 1.0; utter.pitch = 1.05; }
 
-    setLoading(true);
-    setResponseLog({ status: 'browser-tts', message: 'Speaking as ' + persona + ' using voice: ' + (voice ? voice.name : 'default') });
+    setSpeaking(true);
+    setAudioUrl(null);
+    setResponseLog({ status: 'speaking', message: 'Speaking as ' + persona + ' using ' + (voice ? voice.name : 'default voice') });
 
+    utter.onstart = () => {
+      setResponseLog({ status: 'speaking', message: 'Now speaking...' });
+    };
     utter.onend = () => {
-      setLoading(false);
+      setSpeaking(false);
       setResponseLog({ status: 'complete', message: 'Browser TTS finished.' });
     };
     utter.onerror = (e) => {
-      setLoading(false);
-      setResponseLog({ status: 'error', message: 'Browser TTS error: ' + e.error });
+      setSpeaking(false);
+      setResponseLog({ status: 'error', message: 'Speech error: ' + e.error });
     };
+
     synth.speak(utter);
-  }, [text, persona, getVoiceForPersona]);
+  }, [text, persona, getVoiceForPersona, voices]);
 
   const streamBrowser = useCallback(() => {
     const synth = window.speechSynthesis;
     if (!synth) {
-      setResponseLog({ status: 'error', message: 'Browser TTS not supported' });
+      setResponseLog({ status: 'error', message: 'Browser TTS not supported.' });
       return;
     }
+    if (!synth.getVoices().length) {
+      setResponseLog({
+        status: 'error',
+        message: 'No TTS voices found. Install: sudo dnf install speech-dispatcher espeak-ng'
+      });
+      return;
+    }
+
+    if (synth.paused) synth.resume();
     synth.cancel();
+
     const sentences = text.replace(/[?!]/g, '.').split('.').map((s) => s.trim()).filter((s) => s.length > 0);
     if (!sentences.length) return;
 
-    setLoading(true);
+    setSpeaking(true);
+    setAudioUrl(null);
     const logChunks = [];
     let completed = 0;
 
@@ -115,26 +153,35 @@ export default function App() {
 
       utter.onstart = () => {
         logChunks.push({ chunk_index: i + 1, total_chunks: sentences.length, status: 'streaming', text_chunk: chunk });
-        setResponseLog({ status: 'streaming', chunks: [...logChunks], message: 'Streaming chunk ' + (i + 1) + '/' + sentences.length });
+        setResponseLog({ status: 'streaming', chunks: [...logChunks], message: 'Speaking chunk ' + (i + 1) + '/' + sentences.length });
       };
       utter.onend = () => {
         completed++;
         if (completed >= sentences.length) {
-          setLoading(false);
+          setSpeaking(false);
           setResponseLog({ status: 'complete', chunks: logChunks, message: 'Browser TTS stream complete.' });
         }
       };
-      utter.onerror = (e) => {
-        setLoading(false);
-        setResponseLog({ status: 'error', message: 'Chunk ' + (i + 1) + ' error: ' + e.error });
+      utter.onerror = () => {
+        setSpeaking(false);
+        setResponseLog({ status: 'error', message: 'Chunk ' + (i + 1) + ' failed.' });
       };
       synth.speak(utter);
     });
-  }, [text, persona, getVoiceForPersona]);
+  }, [text, persona, getVoiceForPersona, voices]);
+
+  const handleStop = useCallback(() => {
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    stopStream();
+    setSpeaking(false);
+    setLoading(false);
+    setStreaming && setStreaming(false);
+  }, [stopStream]);
 
   const handleSynthesize = async (e) => {
     e.preventDefault();
     setResponseLog(null);
+    setAudioUrl(null);
 
     if (backendAvailable === false) {
       if (useStreaming) streamBrowser();
@@ -153,6 +200,9 @@ export default function App() {
         const data = await res.json();
         setResponseLog(data);
         setBackendAvailable(true);
+        if (data.audio_base64) {
+          setAudioUrl('data:audio/wav;base64,' + data.audio_base64);
+        }
         return;
       } catch {
         setBackendAvailable(false);
@@ -177,6 +227,9 @@ export default function App() {
       });
       const data = await res.json();
       setResponseLog(data);
+      if (data.audio_base64) {
+        setAudioUrl('data:audio/wav;base64,' + data.audio_base64);
+      }
     } catch (err) {
       setResponseLog({ status: 'error', message: String(err) });
     } finally {
@@ -190,6 +243,8 @@ export default function App() {
       : backendAvailable === true
       ? '🔌 Backend mode'
       : '⏳ Detecting backend...';
+
+  const isActive = speaking || streaming || loading;
 
   return (
     <div className="min-h-screen p-6 font-sans max-w-4xl mx-auto">
@@ -230,9 +285,9 @@ export default function App() {
             )}
           </div>
 
-          {backendAvailable === false && voices.length > 0 && (
+          {backendAvailable === false && (
             <div>
-              <label className="block text-sm font-medium mb-1">Browser Voice</label>
+              <label className="block text-sm font-medium mb-1">Browser Voice {voices.length === 0 && <span className="text-red-400">(none found)</span>}</label>
               <select
                 className="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white text-xs"
                 value={selectedVoice ? selectedVoice.name : ''}
@@ -241,10 +296,16 @@ export default function App() {
                   setSelectedVoice(v || voices[0]);
                 }}
               >
+                {voices.length === 0 && <option value="">No voices — install speech-dispatcher</option>}
                 {voices.map((v) => (
                   <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>
                 ))}
               </select>
+              {voices.length === 0 && (
+                <p className="text-xs text-red-400 mt-1">
+                  No TTS voices detected. Run: sudo dnf install speech-dispatcher espeak-ng
+                </p>
+              )}
             </div>
           )}
 
@@ -275,15 +336,15 @@ export default function App() {
           <div className="flex space-x-2">
             <button
               type="submit"
-              disabled={loading || streaming}
+              disabled={isActive}
               className="flex-1 bg-cyan-600 hover:bg-cyan-500 font-semibold py-2 px-4 rounded transition duration-150 disabled:opacity-50"
             >
-              {loading || streaming ? 'Synthesizing...' : 'Generate Voice Stream'}
+              {isActive ? 'Synthesizing...' : 'Generate Voice Stream'}
             </button>
-            {streaming && (
+            {isActive && (
               <button
                 type="button"
-                onClick={stopStream}
+                onClick={handleStop}
                 className="bg-red-600 hover:bg-red-500 font-semibold py-2 px-4 rounded transition duration-150"
               >
                 Stop
@@ -294,6 +355,15 @@ export default function App() {
 
         <div className="bg-gray-800 p-6 rounded-lg shadow border border-gray-700 flex flex-col">
           <h2 className="text-lg font-semibold mb-3 text-cyan-300">Execution Output</h2>
+
+          {audioUrl && (
+            <div className="mb-3">
+              <audio controls src={audioUrl} className="w-full" autoPlay>
+                Your browser does not support the audio element.
+              </audio>
+            </div>
+          )}
+
           <div className="flex-1 bg-gray-900 p-4 rounded border border-gray-700 font-mono text-xs overflow-auto max-h-96">
             {useStreaming && backendAvailable !== false ? (
               <>
