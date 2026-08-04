@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAudioStream } from './hooks/useAudioStream';
 
 export default function App() {
@@ -15,7 +15,6 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState(null);
 
   const { chunks, streaming, error: wsError, startStream, stopStream } = useAudioStream();
-  const synthRef = useRef(window.speechSynthesis);
 
   // Detect backend
   useEffect(() => {
@@ -34,11 +33,10 @@ export default function App() {
       });
   }, []);
 
-  // Load browser TTS voices with retry
+  // Load browser TTS voices
   useEffect(() => {
-    const synth = synthRef.current;
+    const synth = window.speechSynthesis;
     if (!synth) return;
-
     let retries = 0;
     const loadVoices = () => {
       const v = synth.getVoices();
@@ -50,13 +48,25 @@ export default function App() {
         setTimeout(loadVoices, 300);
       }
     };
-
     loadVoices();
     if (synth.onvoiceschanged !== undefined) {
       synth.onvoiceschanged = loadVoices;
     }
     return () => { synth.onvoiceschanged = null; };
   }, []);
+
+  // Set audioUrl when streaming completes
+  useEffect(() => {
+    if (chunks.length > 0) {
+      const last = chunks[chunks.length - 1];
+      if (last.status === 'complete' && chunks.length > 1) {
+        const first = chunks[0];
+        if (first.audio_chunk_base64) {
+          setAudioUrl('data:audio/wav;base64,' + first.audio_chunk_base64);
+        }
+      }
+    }
+  }, [chunks]);
 
   const getVoiceForPersona = useCallback(() => {
     if (!voices.length) return null;
@@ -73,7 +83,7 @@ export default function App() {
   }, [persona, voices]);
 
   const stopAllAudio = useCallback(() => {
-    const synth = synthRef.current;
+    const synth = window.speechSynthesis;
     if (synth) {
       synth.cancel();
       if (synth.paused) synth.resume();
@@ -84,24 +94,19 @@ export default function App() {
   }, [stopStream]);
 
   const speakBrowser = useCallback(() => {
-    const synth = synthRef.current;
+    const synth = window.speechSynthesis;
     if (!synth) {
       setResponseLog({ status: 'error', message: 'Browser TTS not supported.' });
-      setLoading(false);
       return;
     }
-
     const v = synth.getVoices();
     if (!v.length) {
       setResponseLog({
         status: 'error',
         message: 'No TTS voices found. On Fedora: sudo dnf install speech-dispatcher espeak-ng'
       });
-      setLoading(false);
       return;
     }
-
-    // Aggressive cancel to prevent echo/double-play
     synth.cancel();
     if (synth.paused) synth.resume();
 
@@ -125,12 +130,11 @@ export default function App() {
       setSpeaking(false);
       setResponseLog({ status: 'error', message: 'Speech error: ' + e.error });
     };
-
     synth.speak(utter);
   }, [text, persona, getVoiceForPersona]);
 
   const streamBrowser = useCallback(() => {
-    const synth = synthRef.current;
+    const synth = window.speechSynthesis;
     if (!synth) {
       setResponseLog({ status: 'error', message: 'Browser TTS not supported.' });
       setLoading(false);
@@ -145,15 +149,11 @@ export default function App() {
       setLoading(false);
       return;
     }
-
     synth.cancel();
     if (synth.paused) synth.resume();
 
     const sentences = text.replace(/[?!]/g, '.').split('.').map((s) => s.trim()).filter((s) => s.length > 0);
-    if (!sentences.length) {
-      setLoading(false);
-      return;
-    }
+    if (!sentences.length) { setLoading(false); return; }
 
     setSpeaking(true);
     setAudioUrl(null);
@@ -189,7 +189,6 @@ export default function App() {
 
   const handleSynthesize = async (e) => {
     e.preventDefault();
-    // Immediate lock — prevents echo from double-clicks
     if (loading || speaking || streaming) return;
 
     setResponseLog(null);
@@ -271,7 +270,6 @@ export default function App() {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div className="space-y-4">
-          {/* Backend directions panel */}
           {backendAvailable === false && (
             <div className="bg-yellow-900/30 border border-yellow-700 p-4 rounded-lg">
               <h3 className="text-yellow-400 font-semibold text-sm mb-2">🔌 Enable Full Backend</h3>
@@ -279,15 +277,10 @@ export default function App() {
                 To unlock WebSocket streaming, Qwen3-TTS engine selection, and higher-quality synthesis:
               </p>
               <div className="bg-gray-900 rounded p-3 font-mono text-xs text-green-400 space-y-1">
-                <div>git clone https://github.com/swipswaps/talk-with-me-local.git</div>
                 <div>cd talk-with-me-local</div>
-                <div>chmod +x run.sh</div>
                 <div>./run.sh</div>
                 <div className="text-gray-500"># Then open http://localhost:5173</div>
               </div>
-              <p className="text-gray-400 text-xs mt-2">
-                Or on this machine, run: <span className="text-white font-mono">./run.sh</span>
-              </p>
             </div>
           )}
 
@@ -389,6 +382,16 @@ export default function App() {
                 </button>
               )}
             </div>
+
+            {/* Preview button — works in ANY mode */}
+            <button
+              type="button"
+              onClick={speakBrowser}
+              disabled={isActive}
+              className="w-full bg-purple-600 hover:bg-purple-500 font-semibold py-2 px-4 rounded transition duration-150 disabled:opacity-50 text-sm"
+            >
+              🔊 Preview with Browser Voice
+            </button>
           </form>
         </div>
 
@@ -396,8 +399,9 @@ export default function App() {
           <h2 className="text-lg font-semibold mb-3 text-cyan-300">Execution Output</h2>
 
           {audioUrl && (
-            <div className="mb-3">
-              <audio controls src={audioUrl} className="w-full" autoPlay>
+            <div className="mb-3 bg-gray-900 p-3 rounded border border-gray-600">
+              <p className="text-xs text-gray-400 mb-1">Backend audio response:</p>
+              <audio controls src={audioUrl} className="w-full">
                 Your browser does not support the audio element.
               </audio>
             </div>

@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import struct
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +23,29 @@ class SynthesizeRequest(BaseModel):
     steps: int = Field(default=42, ge=1, le=100)
     cfg: float = Field(default=3.0, ge=0.0, le=20.0)
 
+def make_silent_wav(duration_sec=0.5, sample_rate=8000):
+    """Generate a valid silent WAV file as base64."""
+    num_samples = int(sample_rate * duration_sec)
+    data = b'\x80' * num_samples  # silence for unsigned 8-bit PCM
+
+    header = b'RIFF'
+    header += struct.pack('<I', 36 + len(data))
+    header += b'WAVE'
+    header += b'fmt '
+    header += struct.pack('<I', 16)   # Subchunk1Size
+    header += struct.pack('<H', 1)    # AudioFormat = PCM
+    header += struct.pack('<H', 1)    # NumChannels = mono
+    header += struct.pack('<I', sample_rate)
+    header += struct.pack('<I', sample_rate)  # ByteRate
+    header += struct.pack('<H', 1)    # BlockAlign
+    header += struct.pack('<H', 8)    # BitsPerSample
+    header += b'data'
+    header += struct.pack('<I', len(data))
+
+    return base64.b64encode(header + data).decode()
+
+SILENT_WAV_B64 = make_silent_wav()
+
 @app.get("/health")
 def health_check():
     return {
@@ -37,13 +62,13 @@ def synthesize_speech(payload: SynthesizeRequest):
             "status": "success",
             "engine": payload.engine,
             "persona": payload.persona,
-            "audio_base64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=",
-            "message": f"Synthesis stub completed for {payload.persona} using {payload.engine}."
+            "audio_base64": SILENT_WAV_B64,
+            "message": "Synthesis stub completed for " + payload.persona + " using " + payload.engine + "."
         }
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Synthesis failure: {str(e)}"
+            detail="Synthesis failure: " + str(e)
         )
 
 @app.websocket("/ws/synthesize")
@@ -69,7 +94,7 @@ async def websocket_synthesize(websocket: WebSocket):
                     "persona": persona,
                     "engine": engine,
                     "text_chunk": chunk,
-                    "audio_chunk_base64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+                    "audio_chunk_base64": SILENT_WAV_B64
                 })
 
             await websocket.send_json({
@@ -79,7 +104,7 @@ async def websocket_synthesize(websocket: WebSocket):
     except WebSocketDisconnect:
         print("WebSocket client disconnected.")
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print("WebSocket error: " + str(e))
         await websocket.close()
 
 if __name__ == "__main__":
